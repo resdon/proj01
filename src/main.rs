@@ -35,6 +35,3 @@ event_loop.run(move |event, _, control_flow| {
         _ => (),
     }
 });
-
-
-fg
