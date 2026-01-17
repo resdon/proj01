@@ -326,13 +326,67 @@ impl ApplicationHandler for MyApp {
                         winit::event::MouseButton::Left => {
                             // 1. Check Context Menu
                             if let Some((cx, cy)) = self.context_menu {
-                                if mx >= cx && mx <= cx + 120.0 && my >= cy && my <= cy + 60.0 {
+
+                                let is_on_open = mx >= cx && mx <= cx + 120.0 && my >= cy && my <= cy + 20.0;
+                                let is_on_cut = mx >= cx && mx <= cx + 120.0 && my >= cy + 20.0 && my <= cy + 40.0;
+                                let is_on_copy = mx >= cx && mx <= cx + 120.0 && my >= cy + 40.0 && my <= cy + 60.0;
+                                let is_on_copy_path = mx >= cx && mx <= cx + 120.0 && my >= cy + 60.0 && my <= cy + 80.0;
+                                let is_on_paste = mx >= cx && mx <= cx + 120.0 && my >= cy + 80.0 && my <= cy + 100.0;
+                                let is_on_rename = mx >= cx && mx <= cx + 120.0 && my >= cy + 100.0 && my <= cy + 120.0;
+                                let is_on_delete = mx >= cx && mx <= cx + 120.0 && my >= cy + 120.0 && my <= cy + 140.0;
+                                let is_on_properties = mx >= cx && mx <= cx + 120.0 && my >= cy + 140.0 && my <= cy + 165.5;
+
+                                if is_on_open {
                                     if let Some(&first_sel) = self.selected_indices.iter().next() {
                                         self.open_item(first_sel);
                                     }
                                     self.context_menu = None;
                                     return;
-                                }
+                                } else if is_on_cut {
+                                    let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                    self.cut_item(selected);
+                                    self.context_menu = None;
+                                    return;
+                                } else if is_on_copy {
+                                    let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                    self.copy_item(selected);
+                                    self.context_menu = None;
+                                    return;
+                                } else if is_on_copy_path {
+                                    let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                    for &idx in &selected {
+                                        self.copy_path(idx);
+                                    }
+                                    self.context_menu = None;
+                                    return;
+                                } else if is_on_paste {
+                                    self.paste_item();
+                                    self.context_menu = None;
+                                    return;
+                                } else if is_on_rename {
+                                    let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                    for &idx in &selected {
+                                        self.rename_item(idx, "renamed_item");
+                                    }
+                                    self.context_menu = None;
+                                    return;
+                                } else if is_on_delete {
+                                    let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                    for &idx in &selected {
+                                        self.remove_item(idx);
+                                    }
+                                    self.context_menu = None;
+                                    return;
+                                } else if is_on_properties {
+                                     // Handle properties
+                                     // Placeholder logic
+                                     // You can add specific property handling here
+                                     // For now, just close the context menu
+                                     self.context_menu = None; // Close the context menu
+                                     return; // Return early to avoid further processing
+                                 }
+
+
                             }
                             self.context_menu = None;
 
@@ -498,7 +552,7 @@ impl ApplicationHandler for MyApp {
                         if parts.len() >= 2 {
                             Self::draw_text(frame, &self.font, parts[0], 180, y_pos + 16, 12.0, [255, 215, 0]);
                             Self::draw_text(frame, &self.font, parts[1], 240, y_pos + 16, 12.0, [255, 255, 255]);
-                            Self::draw_text(frame, &self.font, parts[2], 400, y_pos + 16, 12.0, [255, 255, 255]);
+                            Self::draw_text(frame, &self.font, parts[2], 400, y_pos + 16, 12.0, [0, 255, 255]);
                             Self::draw_text(frame, &self.font, parts[3], 600, y_pos + 16, 12.0, [200, 200, 200]);
                             Self::draw_text(frame, &self.font, parts[4], 700, y_pos + 16, 12.0, [200, 200, 200]);
                             Self::draw_text(frame, &self.font, parts[5], 800, y_pos + 16, 12.0, [200, 200, 200]);
@@ -514,7 +568,7 @@ impl ApplicationHandler for MyApp {
                     if let Some((cx, cy)) = self.context_menu {
                         let menu_w = 120;
                         let menu_h = 170; // CHANGE: Reduced from 480 to 150
-                        let bg_color = [30, 30, 46, 255]; // CHANGE: Darker navy/slate color
+                        let bg_color = [0, 0, 0, 255]; // CHANGE: Darker navy/slate color
 
                         // Draw main background
                         Self::draw_rect(frame, cx as u32, cy as u32, menu_w, menu_h, bg_color);
