@@ -32,7 +32,8 @@ struct MyApp {
     selected_indices: HashSet<usize>, 
     context_menu: Option<(f32, f32)>,
     selection_start: Option<(f32, f32)>, 
-    selection_rect: Option<(f32, f32, f32, f32)>, 
+    selection_rect: Option<(f32, f32, f32, f32)>,
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl MyApp {
@@ -112,6 +113,153 @@ impl MyApp {
             }
         }
     }
+
+
+    // Helper to get the current directory or the default sync path
+    fn get_current_dir(&self) -> PathBuf {
+        let path = PathBuf::from(&self.input_text);
+        if path.exists() && path.is_dir() {
+            path
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
+    }
+
+    // Parses the [TYPE];NAME;SIZE... format used in your scan_dir logic
+    fn get_item_info(&self, index: usize) -> Option<(String, bool)> {
+        let line = self.file_list.get(index)?;
+        let parts: Vec<&str> = line.split(';').collect();
+        if parts.len() >= 2 {
+            let is_dir = parts[0] == "[DIR]";
+            let name = parts[1].to_string();
+            Some((name, is_dir))
+        } else {
+            None
+        }
+    }
+
+    // Helper for recursive directory copying
+    fn copy_dir_recursive(&self, src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                self.copy_dir_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+            } else {
+                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cut_item(&mut self, indices: Vec<usize>) {
+        let mut paths = Vec::new();
+        for index in indices {
+            if let Some((name, _)) = self.get_item_info(index) {
+                let path = self.get_current_dir().join(name);
+                paths.push(path.to_string_lossy().into_owned());
+            }
+        }
+        if !paths.is_empty() {
+            if let Some(ref mut cb) = self.clipboard {
+                let _ = cb.set_text(format!("CUT:{}", paths.join("|")));
+                // The clipboard object is NOT dropped here, so the OS keeps the data!
+            }
+        }
+    }
+
+    fn copy_item(&mut self, indices: Vec<usize>) {
+        let mut paths = Vec::new();
+        for index in indices {
+            if let Some((name, _)) = self.get_item_info(index) {
+                let path = self.get_current_dir().join(name);
+                paths.push(path.to_string_lossy().into_owned());
+            }
+        }
+        if !paths.is_empty() {
+            if let Some(ref mut cb) = self.clipboard {
+                let _ = cb.set_text(format!("COPY:{}", paths.join("|")));
+            }
+        }
+    }
+
+    fn paste_item(&mut self) {
+        // Use the persistent clipboard
+        let content = if let Some(ref mut cb) = self.clipboard {
+            cb.get_text().ok()
+        } else {
+            None
+        };
+
+        if let Some(content) = content {
+            let (is_cut, paths_raw) = if content.starts_with("CUT:") {
+                (true, &content[4..])
+            } else if content.starts_with("COPY:") {
+                (false, &content[5..])
+            } else {
+                (false, content.as_str()) // Fallback for external paths
+            };
+
+            let dest_dir = self.get_current_dir();
+            for path_str in paths_raw.split('|') {
+                let src = std::path::PathBuf::from(path_str);
+                if src.exists() {
+                    let dest = dest_dir.join(src.file_name().unwrap_or_default());
+                    if src == dest { continue; } // Avoid self-copy
+
+                    let res = if src.is_dir() {
+                        self.copy_dir_recursive(&src, &dest)
+                    } else {
+                        std::fs::copy(&src, &dest).map(|_| ())
+                    };
+
+                    if res.is_ok() && is_cut {
+                        let _ = if src.is_dir() { std::fs::remove_dir_all(&src) } 
+                                else { std::fs::remove_file(&src) };
+                    }
+                }
+            }
+            self.trigger_refresh();
+        }
+    }
+
+    fn copy_path(&mut self, index: usize) {
+        if let Some((name, _)) = self.get_item_info(index) {
+            let path = self.get_current_dir().join(&name);
+            let _ = arboard::Clipboard::new().ok().and_then(|mut cb| 
+                cb.set_text(path.to_string_lossy().into_owned()).ok()
+            );
+        }
+    }
+
+    fn rename_item(&mut self, index: usize, new_name: &str) {
+        if let Some((old_name, _)) = self.get_item_info(index) {
+            let base = self.get_current_dir();
+            let old_path = base.join(old_name);
+            let new_path = base.join(new_name);
+            
+            if !new_path.exists() && std::fs::rename(old_path, new_path).is_ok() {
+                self.trigger_refresh();
+            }
+        }
+    }
+
+    fn remove_item(&mut self, index: usize) {
+        if let Some((name, is_dir)) = self.get_item_info(index) {
+            let path = self.get_current_dir().join(name);
+            let res = if is_dir {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            
+            if res.is_ok() {
+                self.trigger_refresh();
+            }
+        }
+    }
+    
 }
 
 impl ApplicationHandler for MyApp {
@@ -125,6 +273,7 @@ impl ApplicationHandler for MyApp {
             let pixels = Pixels::new(WIDTH, HEIGHT, surface).expect("Pixels error");
             self.window = Some(window);
             self.pixels = Some(pixels);
+            self.clipboard = arboard::Clipboard::new().ok();
             self.trigger_refresh();
         }
     }
@@ -156,6 +305,22 @@ impl ApplicationHandler for MyApp {
             }
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
                 let (mx, my) = self.mouse_pos;
+
+                if button == winit::event::MouseButton::Right && state.is_pressed() {
+                    let menu_width = 120.0;
+                    let menu_height = 150.0; // MATCH: Change this to match the new visual height (150)
+
+                    // Auto-flip logic: ensures menu stays within bounds
+                    let spawn_x = if mx + menu_width > WIDTH as f32 { mx - menu_width } else { mx };
+                    let spawn_y = if my + menu_height > (HEIGHT - 70) as f32 { 
+                        my - menu_height // Flip up if too close to the footer
+                    } else { 
+                        my 
+                    };
+
+                    self.context_menu = Some((spawn_x, spawn_y));
+                }
+
                 if state == winit::event::ElementState::Pressed {
                     match button {
                         winit::event::MouseButton::Left => {
@@ -175,6 +340,18 @@ impl ApplicationHandler for MyApp {
                             let is_on_back = mx >= 10.0 && mx <= 85.0 && my >= 10.0 && my <= 40.0;
                             let is_on_refresh = mx >= 90.0 && mx <= 165.0 && my >= 10.0 && my <= 40.0;
                             let is_on_path = mx >= 170.0 && mx <= 870.0 && my >= 10.0 && my <= 40.0;
+                            // Inside window_event MouseInput logic:
+                            let is_on_open = mx >= 180.0 && mx <= 230.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_opw = mx >= 240.0 && mx <= 290.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_create = mx >= 300.0 && mx <= 350.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_blank = mx >= 360.0 && mx <= 410.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_cut = mx >= 420.0 && mx <= 470.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_copy = mx >= 480.0 && mx <= 530.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_copy_path = mx >= 540.0 && mx <= 590.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_paste = mx >= 600.0 && mx <= 650.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_rename = mx >= 660.0 && mx <= 710.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_delete = mx >= 720.0 && mx <= 770.0 && my >= 470.0 && my <= 520.0;
+                            let is_on_properties = mx >= 780.0 && mx <= 830.0 && my >= 470.0 && my <= 520.0;
 
                             if is_on_back {
                                 let mut path = PathBuf::from(&self.input_text);
@@ -184,6 +361,35 @@ impl ApplicationHandler for MyApp {
                                 self.trigger_refresh();
                                 return;
                             } else if is_on_path {
+                                return;
+                            } else if is_on_cut {
+                                let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                self.cut_item(selected); // Now accepts Vec<usize>
+                                return;
+                            } else if is_on_copy {
+                                let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                self.copy_item(selected); // Now accepts Vec<usize>
+                                return;
+                            } else if is_on_copy_path {
+                                let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                for &idx in &selected {
+                                    self.copy_path(idx);
+                                }
+                                return;
+                            } else if is_on_paste {
+                                self.paste_item();
+                                return;
+                            } else if is_on_rename {
+                                let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                for &idx in &selected {
+                                    self.rename_item(idx, "renamed_item"); // Placeholder new name
+                                }
+                                return;
+                            } else if is_on_delete {
+                                let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                for &idx in &selected {
+                                    self.remove_item(idx);
+                                }
                                 return;
                             }
 
@@ -212,19 +418,7 @@ impl ApplicationHandler for MyApp {
                                 }
                             }
                         }
-                        winit::event::MouseButton::Right => {
-                            if mx >= LIST_X && mx <= LIST_X + LIST_W && my >= 70.0 {
-                                let row_idx = ((my - 70.0) / ROW_H as f32) as usize;
-                                let actual_idx = self.scroll_index + row_idx;
-                                if actual_idx < self.file_list.len() {
-                                    if !self.selected_indices.contains(&actual_idx) {
-                                        self.selected_indices.clear();
-                                        self.selected_indices.insert(actual_idx);
-                                    }
-                                    self.context_menu = Some((mx, my));
-                                }
-                            }
-                        }
+
                         _ => {}
                     }
                 } else {
@@ -233,6 +427,7 @@ impl ApplicationHandler for MyApp {
                     self.selection_rect = None;
                 }
             }
+
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 if let winit::event::MouseScrollDelta::LineDelta(_, y) = delta {
                     if y > 0.0 { self.scroll_index = self.scroll_index.saturating_sub(1); }
@@ -271,17 +466,21 @@ impl ApplicationHandler for MyApp {
                     let btn_hover = |x: f32, y: f32, w: f32, h: f32| mx >= x && mx <= x+w && my >= y && my <= y+h;
 
                     // Header Buttons
+                    // Back
                     let b_col = if btn_hover(10.0, 10.0, 75.0, 30.0) { [0, 150, 150, 255] } else { [0, 100, 100, 255] };
                     Self::draw_rect(frame, 10, 10, 75, 30, b_col);
                     Self::draw_text(frame, &self.font, "Back", 15, 30, 18.0, [255, 255, 255]);
-
+                    
+                    // Refresh
                     let r_col = if btn_hover(90.0, 10.0, 75.0, 30.0) { [0, 150, 150, 255] } else { [0, 100, 100, 255] };
                     Self::draw_rect(frame, 90, 10, 75, 30, r_col);
                     Self::draw_text(frame, &self.font, "Refresh", 95, 30, 18.0, [255, 255, 255]);
 
-                    // Path Bar & Sidebar
-                    Self::draw_rect(frame, 170, 10, 700, 30, [255, 255, 255, 255]); 
+                    // Path Bar
+                    Self::draw_rect(frame, 170, 10, 700, 30, [200, 100, 0, 255]); 
                     Self::draw_text(frame, &self.font, &self.input_text, 175, 32, 18.0, [0, 0, 0]); 
+
+                    // Sidebar
                     Self::draw_rect(frame, 10, 70, 150, 460, [40, 40, 40, 255]); 
 
                     // File List
@@ -299,6 +498,10 @@ impl ApplicationHandler for MyApp {
                         if parts.len() >= 2 {
                             Self::draw_text(frame, &self.font, parts[0], 180, y_pos + 16, 12.0, [255, 215, 0]);
                             Self::draw_text(frame, &self.font, parts[1], 240, y_pos + 16, 12.0, [255, 255, 255]);
+                            Self::draw_text(frame, &self.font, parts[2], 400, y_pos + 16, 12.0, [255, 255, 255]);
+                            Self::draw_text(frame, &self.font, parts[3], 600, y_pos + 16, 12.0, [200, 200, 200]);
+                            Self::draw_text(frame, &self.font, parts[4], 700, y_pos + 16, 12.0, [200, 200, 200]);
+                            Self::draw_text(frame, &self.font, parts[5], 800, y_pos + 16, 12.0, [200, 200, 200]);
                         }
                     }
 
@@ -309,8 +512,20 @@ impl ApplicationHandler for MyApp {
 
                     // Context Menu (Drawn on top)
                     if let Some((cx, cy)) = self.context_menu {
-                        Self::draw_rect(frame, cx as u32, cy as u32, 120, 60, [50, 50, 50, 255]);
-                        Self::draw_text(frame, &self.font, "Open", cx as u32 + 10, cy as u32 + 25, 14.0, [255, 255, 255]);
+                        let menu_w = 120;
+                        let menu_h = 170; // CHANGE: Reduced from 480 to 150
+                        let bg_color = [30, 30, 46, 255]; // CHANGE: Darker navy/slate color
+
+                        // Draw main background
+                        Self::draw_rect(frame, cx as u32, cy as u32, menu_w, menu_h, bg_color);
+
+                        // Draw items with tighter spacing (e.g., 30px apart)
+                        let items = ["Open", "Cut", "Copy", "Copy Path", "Paste", "Rename", "Delete", "Properties"];
+                        for (i, text) in items.iter().enumerate() {
+                            let item_y = cy as u32 + (i as u32 * 20);
+                            // Optional: Draw a hover effect or separator here
+                            Self::draw_text(frame, &self.font, text, cx as u32 + 10, item_y + 20, 13.0, [255, 255, 255]);
+                        }
                     }
 
                     // Scrollbar
@@ -323,6 +538,41 @@ impl ApplicationHandler for MyApp {
                         let thumb_col = if self.is_dragging_scrollbar { [200, 200, 200, 255] } else { [120, 120, 120, 255] };
                         Self::draw_rect(frame, 880, thumb_y as u32, 12, thumb_h as u32, thumb_col);
                     }
+
+                    // Operations footer
+                    Self::draw_rect(frame, 170, 460, 700, 70, [200, 100, 0, 255]);
+                    // Operations buttons
+                    Self::draw_rect(frame, 180, 470, 50, 50, [255, 0, 0, 255]);
+                    Self::draw_text(frame, &self.font, "Opn", 185, 500, 20.0, [255, 255, 255]);
+                    Self::draw_rect(frame, 240, 470, 50, 50, [0, 255, 0, 255]);
+                    Self::draw_text(frame, &self.font, "Opw", 245, 500, 20.0, [255, 255, 255]);
+                    Self::draw_rect(frame, 300, 470, 50, 50, [0, 0, 255, 255]);
+                    Self::draw_text(frame, &self.font, "Cr", 310, 500, 20.0, [255, 255, 255]);
+                    Self::draw_rect(frame, 360, 470, 50, 50, [255, 255, 0, 255]);
+                    Self::draw_text(frame, &self.font, "", 370, 500, 20.0, [255, 255, 255]);
+
+                    // Cut, Copy, CopyPath, Paste, Rename
+                    // Cut 420
+                    Self::draw_rect(frame, 420, 470, 50, 50, [0, 255, 255, 255]);
+                    Self::draw_text(frame, &self.font, "Cut", 430, 500, 20.0, [255, 255, 255]);
+                    // Copy 480
+                    Self::draw_rect(frame, 480, 470, 50, 50, [255, 0, 255, 255]);
+                    Self::draw_text(frame, &self.font, "CP", 490, 500, 20.0, [255, 255, 255]);
+                    // Copy Path 540
+                    Self::draw_rect(frame, 540, 470, 50, 50, [192, 192, 192, 255]);
+                    Self::draw_text(frame, &self.font, "CPp", 550, 500, 20.0, [255, 255, 255]);
+                    // Paste 600
+                    Self::draw_rect(frame, 600, 470, 50, 50, [128, 0, 128, 255]);
+                    Self::draw_text(frame, &self.font, "Pst", 610, 500, 20.0, [255, 255, 255]);
+                    // Rename 660
+                    Self::draw_rect(frame, 660, 470, 50, 50, [0, 128, 128, 255]);
+                    Self::draw_text(frame, &self.font, "Ren", 670, 500, 20.0, [255, 255, 255]);
+                    // Delete 720
+                    Self::draw_rect(frame, 720, 470, 50, 50, [128, 128, 0, 255]);
+                    Self::draw_text(frame, &self.font, "Del", 730, 500, 20.0, [255, 255, 255]);
+                    // Properties
+                    Self::draw_rect(frame, 780, 470, 50, 50, [0, 0, 0, 255]);
+                    Self::draw_text(frame, &self.font, "Prp", 790, 500, 20.0, [255, 255, 255]);
 
                     pixels.render().unwrap();
                 }
@@ -342,7 +592,7 @@ fn main() {
         input_text: std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned(), 
         file_list: Vec::new(), temp_list: Vec::new(), receiver: None, scroll_index: 0, 
         mouse_pos: (0.0, 0.0), is_dragging_scrollbar: false, selected_indices: HashSet::new(), 
-        context_menu: None, selection_start: None, selection_rect: None,
+        context_menu: None, selection_start: None, selection_rect: None, clipboard: None,
     }; 
     event_loop.run_app(&mut app).unwrap(); 
 }

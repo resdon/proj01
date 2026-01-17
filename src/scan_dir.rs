@@ -36,7 +36,7 @@ pub fn scan_dir(path_str: String, tx: Sender<String>) {
 
                     if let Ok(meta) = fs::symlink_metadata(&path) {
                         let file_type = meta.file_type();
-                        let prefix = if file_type.is_symlink() { "[LNK]" } 
+                        let prefix = if file_type.is_symlink() { "[LINK]" } 
                                     else if file_type.is_dir() { "[DIR]" } 
                                     else { "[FILE]" };
 
@@ -48,8 +48,9 @@ pub fn scan_dir(path_str: String, tx: Sender<String>) {
 
                         let mtime = meta.modified().map(format_ago).unwrap_or_else(|_| "N/A".into());
                         let atime = meta.accessed().map(format_ago).unwrap_or_else(|_| "N/A".into());
+                        let ctime = meta.created().map(format_ago).unwrap_or_else(|_| "N/A".into());
 
-                        let data = format!("{};{};{};{};{}", prefix, name, s_str, mtime, atime);
+                        let data = format!("{};{};{};{};{};{}", prefix, name, s_str, mtime, atime, ctime);
                         if tx.send(data).is_err() { return; }
                     }
                 }
