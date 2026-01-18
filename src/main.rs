@@ -8,6 +8,8 @@ use scan_dir::scan_dir;
 use std::sync::mpsc::{channel, Receiver};
 use std::collections::HashSet;
 use std::path::PathBuf;
+mod world;
+use world::World;
 
 const WIDTH: u32 = 960;  
 const HEIGHT: u32 = 540; 
@@ -17,11 +19,12 @@ const TRACK_H: f32 = 375.0;
 const ROW_H: u32 = 25; 
 const LIST_X: f32 = 170.0;
 const LIST_W: f32 = 700.0;
+const FONT_DATA: &[u8] = include_bytes!("../font.ttf");
 
 struct MyApp {
     window: Option<Arc<Window>>,      
     pixels: Option<Pixels<'static>>,
-    font: fontdue::Font,
+    world: World,
     input_text: String,
     file_list: Vec<String>,
     temp_list: Vec<String>,
@@ -34,6 +37,7 @@ struct MyApp {
     selection_start: Option<(f32, f32)>, 
     selection_rect: Option<(f32, f32, f32, f32)>,
     clipboard: Option<arboard::Clipboard>,
+    properties_window: Option<(f32, f32)>, // New field for properties window position
 }
 
 impl MyApp {
@@ -54,30 +58,6 @@ impl MyApp {
                     }
                 }
             }
-        }
-    }
-
-    fn draw_text(frame: &mut [u8], font: &fontdue::Font, text: &str, start_x: u32, start_y: u32, size: f32, color: [u8; 3]) {
-        let mut x_cursor = start_x;
-        for char in text.chars() {
-            let (metrics, bitmap) = font.rasterize(char, size);
-            for row in 0..metrics.height {
-                for col in 0..metrics.width {
-                    let opacity = bitmap[row * metrics.width + col];
-                    if opacity > 0 {
-                        let target_x = x_cursor as i32 + metrics.xmin + col as i32;
-                        let target_y = start_y as i32 - metrics.ymin - metrics.height as i32 + row as i32;
-                        if target_x >= 0 && target_x < WIDTH as i32 && target_y >= 0 && target_y < HEIGHT as i32 {
-                            let index = ((target_y as u32 * WIDTH + target_x as u32) * 4) as usize;
-                            frame[index] = color[0];
-                            frame[index + 1] = color[1];
-                            frame[index + 2] = color[2];
-                            frame[index + 3] = opacity;
-                        }
-                    }
-                }
-            }
-            x_cursor += metrics.advance_width as u32;
         }
     }
 
@@ -303,10 +283,29 @@ impl ApplicationHandler for MyApp {
                     }
                 }
             }
+
+
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
+
                 let (mx, my) = self.mouse_pos;
 
                 if button == winit::event::MouseButton::Right && state.is_pressed() {
+                    // --- ADDED: AUTO-SELECT LOGIC ---
+                    // 1. Check if the click is within the file list area
+                    if mx >= LIST_X && mx <= LIST_X + LIST_W && my >= 70.0 && my <= (70.0 + TRACK_H) {
+                        let row_idx = ((my - 70.0) / ROW_H as f32) as usize;
+                        let actual_idx = self.scroll_index + row_idx;
+
+                        // 2. If it's a valid file, select it
+                        if actual_idx < self.file_list.len() {
+                            // Only change selection if the item isn't already part of a multi-selection
+                            if !self.selected_indices.contains(&actual_idx) {
+                                self.selected_indices.clear();
+                                self.selected_indices.insert(actual_idx);
+                            }
+                        }
+                    }                
+                                        
                     let menu_width = 120.0;
                     let menu_height = 150.0; // MATCH: Change this to match the new visual height (150)
 
@@ -324,6 +323,17 @@ impl ApplicationHandler for MyApp {
                 if state == winit::event::ElementState::Pressed {
                     match button {
                         winit::event::MouseButton::Left => {
+                            // Properties window check
+                            if let Some((cx, cy)) = self.properties_window {
+                                let win_w = 240.0;
+                                let win_h = 240.0;
+                                if mx >= cx && mx <= cx + win_w && my >= cy && my <= cy + win_h {
+                                    return; // Clicked inside properties window, do nothing
+                                } else {
+                                    self.properties_window = None; // Close properties if clicked outside
+                                }
+                            }
+                            
                             // 1. Check Context Menu
                             if let Some((cx, cy)) = self.context_menu {
 
@@ -378,13 +388,11 @@ impl ApplicationHandler for MyApp {
                                     self.context_menu = None;
                                     return;
                                 } else if is_on_properties {
-                                     // Handle properties
-                                     // Placeholder logic
-                                     // You can add specific property handling here
-                                     // For now, just close the context menu
-                                     self.context_menu = None; // Close the context menu
-                                     return; // Return early to avoid further processing
-                                 }
+                                    let selected: Vec<usize> = self.selected_indices.iter().cloned().collect();
+                                    if let Some(&first_sel) = selected.first() {
+                                        self.properties_window = Some((mx, my));
+                                    }
+                                }
 
 
                             }
@@ -523,16 +531,16 @@ impl ApplicationHandler for MyApp {
                     // Back
                     let b_col = if btn_hover(10.0, 10.0, 75.0, 30.0) { [0, 150, 150, 255] } else { [0, 100, 100, 255] };
                     Self::draw_rect(frame, 10, 10, 75, 30, b_col);
-                    Self::draw_text(frame, &self.font, "Back", 15, 30, 18.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Back", 15, 30, 18.0, [255, 255, 255]);
                     
                     // Refresh
                     let r_col = if btn_hover(90.0, 10.0, 75.0, 30.0) { [0, 150, 150, 255] } else { [0, 100, 100, 255] };
                     Self::draw_rect(frame, 90, 10, 75, 30, r_col);
-                    Self::draw_text(frame, &self.font, "Refresh", 95, 30, 18.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Refresh", 95, 30, 18.0, [255, 255, 255]);
 
                     // Path Bar
                     Self::draw_rect(frame, 170, 10, 700, 30, [200, 100, 0, 255]); 
-                    Self::draw_text(frame, &self.font, &self.input_text, 175, 32, 18.0, [0, 0, 0]); 
+                    self.world.draw_text(frame, &self.input_text, 175, 32, 18.0, [0, 0, 0]); 
 
                     // Sidebar
                     Self::draw_rect(frame, 10, 70, 150, 460, [40, 40, 40, 255]); 
@@ -550,12 +558,12 @@ impl ApplicationHandler for MyApp {
                         
                         let parts: Vec<&str> = self.file_list[actual_idx].split(';').collect();
                         if parts.len() >= 2 {
-                            Self::draw_text(frame, &self.font, parts[0], 180, y_pos + 16, 12.0, [255, 215, 0]);
-                            Self::draw_text(frame, &self.font, parts[1], 240, y_pos + 16, 12.0, [255, 255, 255]);
-                            Self::draw_text(frame, &self.font, parts[2], 400, y_pos + 16, 12.0, [0, 255, 255]);
-                            Self::draw_text(frame, &self.font, parts[3], 600, y_pos + 16, 12.0, [200, 200, 200]);
-                            Self::draw_text(frame, &self.font, parts[4], 700, y_pos + 16, 12.0, [200, 200, 200]);
-                            Self::draw_text(frame, &self.font, parts[5], 800, y_pos + 16, 12.0, [200, 200, 200]);
+                            self.world.draw_text(frame, parts[0], 180, (y_pos + 16) as usize, 12.0, [255, 215, 0]);
+                            self.world.draw_text(frame, parts[1], 240, (y_pos + 16) as usize, 12.0, [255, 255, 255]);
+                            self.world.draw_text(frame, parts[2], 400, (y_pos + 16) as usize, 12.0, [0, 255, 255]);
+                            self.world.draw_text(frame, parts[3], 600, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
+                            self.world.draw_text(frame, parts[4], 700, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
+                            self.world.draw_text(frame, parts[5], 800, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
                         }
                     }
 
@@ -578,9 +586,19 @@ impl ApplicationHandler for MyApp {
                         for (i, text) in items.iter().enumerate() {
                             let item_y = cy as u32 + (i as u32 * 20);
                             // Optional: Draw a hover effect or separator here
-                            Self::draw_text(frame, &self.font, text, cx as u32 + 10, item_y + 20, 13.0, [255, 255, 255]);
+                            self.world.draw_text(frame, text, (cx as usize) + 10, (item_y + 20) as usize, 13.0, [255, 255, 255]);
                         }
                     }
+
+                    // Properties Window (Drawn on top)
+                    if let Some((cx, cy)) = self.properties_window {
+                        let win_w: u32 = 240;
+                        let win_h: u32 = 240;
+                        Self::draw_rect(frame, 360 as u32, 150 as u32, win_w, win_h, [50, 50, 50, 255]);
+                        self.world.draw_text(frame, "Properties", 490, 290 + 20, 18.0, [255, 255, 255]);
+                        // Additional properties details can be drawn here
+                    }
+                    
 
                     // Scrollbar
                     if self.file_list.len() > VISIBLE_COUNT {
@@ -597,36 +615,36 @@ impl ApplicationHandler for MyApp {
                     Self::draw_rect(frame, 170, 460, 700, 70, [200, 100, 0, 255]);
                     // Operations buttons
                     Self::draw_rect(frame, 180, 470, 50, 50, [255, 0, 0, 255]);
-                    Self::draw_text(frame, &self.font, "Opn", 185, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Opn", 185, 500, 20.0, [255, 255, 255]);
                     Self::draw_rect(frame, 240, 470, 50, 50, [0, 255, 0, 255]);
-                    Self::draw_text(frame, &self.font, "Opw", 245, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Opw", 245, 500, 20.0, [255, 255, 255]);
                     Self::draw_rect(frame, 300, 470, 50, 50, [0, 0, 255, 255]);
-                    Self::draw_text(frame, &self.font, "Cr", 310, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Cr", 310, 500, 20.0, [255, 255, 255]);
                     Self::draw_rect(frame, 360, 470, 50, 50, [255, 255, 0, 255]);
-                    Self::draw_text(frame, &self.font, "", 370, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "", 370, 500, 20.0, [255, 255, 255]);
 
                     // Cut, Copy, CopyPath, Paste, Rename
                     // Cut 420
                     Self::draw_rect(frame, 420, 470, 50, 50, [0, 255, 255, 255]);
-                    Self::draw_text(frame, &self.font, "Cut", 430, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Cut", 430, 500, 20.0, [255, 255, 255]);
                     // Copy 480
                     Self::draw_rect(frame, 480, 470, 50, 50, [255, 0, 255, 255]);
-                    Self::draw_text(frame, &self.font, "CP", 490, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "CP", 490, 500, 20.0, [255, 255, 255]);
                     // Copy Path 540
                     Self::draw_rect(frame, 540, 470, 50, 50, [192, 192, 192, 255]);
-                    Self::draw_text(frame, &self.font, "CPp", 550, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "CPp", 550, 500, 20.0, [255, 255, 255]);
                     // Paste 600
                     Self::draw_rect(frame, 600, 470, 50, 50, [128, 0, 128, 255]);
-                    Self::draw_text(frame, &self.font, "Pst", 610, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Pst", 610, 500, 20.0, [255, 255, 255]);
                     // Rename 660
                     Self::draw_rect(frame, 660, 470, 50, 50, [0, 128, 128, 255]);
-                    Self::draw_text(frame, &self.font, "Ren", 670, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Ren", 670, 500, 20.0, [255, 255, 255]);
                     // Delete 720
                     Self::draw_rect(frame, 720, 470, 50, 50, [128, 128, 0, 255]);
-                    Self::draw_text(frame, &self.font, "Del", 730, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Del", 730, 500, 20.0, [255, 255, 255]);
                     // Properties
                     Self::draw_rect(frame, 780, 470, 50, 50, [0, 0, 0, 255]);
-                    Self::draw_text(frame, &self.font, "Prp", 790, 500, 20.0, [255, 255, 255]);
+                    self.world.draw_text(frame, "Prp", 790, 500, 20.0, [255, 255, 255]);
 
                     pixels.render().unwrap();
                 }
@@ -638,15 +656,14 @@ impl ApplicationHandler for MyApp {
 }
 
 fn main() {
-    let font_data = include_bytes!("../font.ttf") as &[u8];
-    let font = fontdue::Font::from_bytes(font_data, fontdue::FontSettings::default()).expect("Font error");
     let event_loop = EventLoop::new().unwrap();
+    let world = World::new(WIDTH as usize, HEIGHT as usize, FONT_DATA);
     let mut app = MyApp { 
-        window: None, pixels: None, font, 
+        window: None, pixels: None, world, 
         input_text: std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned(), 
         file_list: Vec::new(), temp_list: Vec::new(), receiver: None, scroll_index: 0, 
         mouse_pos: (0.0, 0.0), is_dragging_scrollbar: false, selected_indices: HashSet::new(), 
-        context_menu: None, selection_start: None, selection_rect: None, clipboard: None,
+        context_menu: None, selection_start: None, selection_rect: None, clipboard: None, properties_window: None,
     }; 
     event_loop.run_app(&mut app).unwrap(); 
 }
