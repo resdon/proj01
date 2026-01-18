@@ -22,6 +22,13 @@ impl FontManager {
 
     pub fn get_glyph(&mut self, character: char, size: f32) -> &CachedGlyph {
         let key = (character, size as u32);
+
+        // If we have more than 2000 characters cached, clear it automatically
+        if self.cache.len() > 5000 {
+            self.cache.clear();
+            self.cache.shrink_to_fit();
+        }
+
         self.cache.entry(key).or_insert_with(|| {
             let (metrics, bitmap) = self.font.rasterize(character, size);
             CachedGlyph {
@@ -30,6 +37,12 @@ impl FontManager {
             }
         })
     }
+
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.cache.shrink_to_fit();
+    }
+
 }
 
 pub struct World {
@@ -39,6 +52,7 @@ pub struct World {
 }
 
 impl World {
+
     pub fn new(width: usize, height: usize, font_data: &[u8]) -> Self {
         Self {
             font_manager: FontManager::new(font_data),
@@ -110,4 +124,10 @@ impl World {
             }
         }
     }
+
+    pub fn clear_font_cache(&mut self) {
+        self.font_manager.clear_cache();
+        self.font_manager.cache.shrink_to_fit();
+    }
+
 }

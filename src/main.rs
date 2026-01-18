@@ -2,6 +2,8 @@ use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler; 
 use winit::event_loop::{ActiveEventLoop, EventLoop}; 
 use winit::window::{Window, WindowId};
+use std::fs::File;
+use std::os::unix::process;
 use std::sync::Arc;
 mod scan_dir;
 use scan_dir::scan_dir;
@@ -10,6 +12,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 mod world;
 use world::World;
+use sysinfo::{Pid, System};
 
 const WIDTH: u32 = 960;  
 const HEIGHT: u32 = 540; 
@@ -21,14 +24,23 @@ const LIST_X: f32 = 170.0;
 const LIST_W: f32 = 700.0;
 const FONT_DATA: &[u8] = include_bytes!("../font.ttf");
 
+struct FileDisplay {
+    prefix: String,
+    name: String,
+    size: String,
+    mtime: String,
+    atime: String,
+    ctime: String,
+}
+
 struct MyApp {
     window: Option<Arc<Window>>,      
     pixels: Option<Pixels<'static>>,
     world: World,
     input_text: String,
-    file_list: Vec<String>,
-    temp_list: Vec<String>,
-    receiver: Option<Receiver<String>>,
+    file_list: Vec<scan_dir::FileDisplay>,
+    temp_list: Vec<scan_dir::FileDisplay>,
+    receiver: Option<Receiver<scan_dir::ScanMsg>>,
     scroll_index: usize, 
     mouse_pos: (f32, f32),
     is_dragging_scrollbar: bool,
@@ -38,6 +50,22 @@ struct MyApp {
     selection_rect: Option<(f32, f32, f32, f32)>,
     clipboard: Option<arboard::Clipboard>,
     properties_window: Option<(f32, f32)>, // New field for properties window position
+    sort_prop: scan_dir::SortProperty,
+    sort_order: scan_dir::SortOrder,
+    show_hidden: bool,
+    frame_count: u64,
+    fps_timer: std::time::Instant,
+    sys: sysinfo::System,
+    cpu_usage: f32,
+    ram_usage: u64,
+    vram_usage: u64,
+    pid: Pid,
+}
+
+fn trim_memory() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 impl MyApp {
@@ -62,13 +90,34 @@ impl MyApp {
     }
 
     fn trigger_refresh(&mut self) {
-        let (tx, rx) = channel();
-        self.temp_list.clear();
-        self.file_list.clear();
+        let (tx, rx) = channel::<scan_dir::ScanMsg>();
+
+        self.world.clear_font_cache(); // Clear font bitmaps on refresh
+        
+        // Replace with empty vectors to drop the old allocated memory
+        self.temp_list = Vec::new();
+        self.file_list = Vec::new();
+
+        trim_memory();
+        
         self.scroll_index = 0;
         self.selected_indices.clear(); 
-        self.receiver = Some(rx);
-        scan_dir(self.input_text.clone(), tx);
+        self.receiver = Some(rx); // Dropping the old rx here triggers the return in scan_dir.rs
+        
+        scan_dir(
+        self.input_text.clone(),
+        tx, self.sort_prop, 
+        self.sort_order, 
+        self.show_hidden
+        );
+
+        if let Some(pixels) = &mut self.pixels {
+            let _ = pixels.render();
+        }
+        unsafe {
+            libc::malloc_trim(0);
+        }
+
     }
 
     fn update_scroll_from_mouse(&mut self, my: f32) {
@@ -79,17 +128,17 @@ impl MyApp {
     }
 
     fn open_item(&mut self, index: usize) {
-        if let Some(line) = self.file_list.get(index) {
-            let parts: Vec<&str> = line.split(';').collect();
-            if parts.len() >= 2 {
-                let mut path = PathBuf::from(&self.input_text);
-                path.push(parts[1]);
-                if parts[0] == "[DIR]" {
-                    self.input_text = path.to_string_lossy().into_owned();
-                    self.trigger_refresh();
-                } else {
-                    let _ = opener::open(path);
-                }
+        if let Some(item) = self.file_list.get(index) {
+            // No more split(';')! Access fields directly.
+            let mut path = PathBuf::from(&self.input_text);
+            path.push(&item.name); // Access the 'name' field
+
+            if item.prefix == "[DIR]" { // Access the 'prefix' field
+                self.input_text = path.to_string_lossy().into_owned();
+                self.trigger_refresh();
+            } else {
+                // It's a file or a link, try to open it with the system default
+                let _ = opener::open(path);
             }
         }
     }
@@ -107,15 +156,14 @@ impl MyApp {
 
     // Parses the [TYPE];NAME;SIZE... format used in your scan_dir logic
     fn get_item_info(&self, index: usize) -> Option<(String, bool)> {
-        let line = self.file_list.get(index)?;
-        let parts: Vec<&str> = line.split(';').collect();
-        if parts.len() >= 2 {
-            let is_dir = parts[0] == "[DIR]";
-            let name = parts[1].to_string();
-            Some((name, is_dir))
-        } else {
-            None
-        }
+        // 1. Get the struct reference from the list
+        let item = self.file_list.get(index)?;
+
+        // 2. Access fields directly (No more split or collect!)
+        let is_dir = item.prefix == "[DIR]";
+        let name = item.name.clone();
+
+        Some((name, is_dir))
     }
 
     // Helper for recursive directory copying
@@ -511,17 +559,29 @@ impl ApplicationHandler for MyApp {
                 }
             }
             winit::event::WindowEvent::RedrawRequested => {
-                if let Some(pixels) = self.pixels.as_mut() {
-                    if let Some(ref rx) = self.receiver {
+                if let Some(ref rx) = self.receiver {
                         for msg in rx.try_iter() {
-                            match msg.as_str() {
-                                "__CLEAR__" => self.temp_list.clear(),
-                                "__DONE__" => self.file_list = self.temp_list.clone(),
-                                _ => self.temp_list.push(msg),
+                            match msg {
+                                scan_dir::ScanMsg::Clear => {
+                                    self.temp_list = Vec::new();
+                                    self.file_list = Vec::new();
+                                }
+                                scan_dir::ScanMsg::Entry(display_data) => {
+                                    self.temp_list.push(display_data);
+                                }
+                                scan_dir::ScanMsg::Done => {
+                                    self.file_list = std::mem::take(&mut self.temp_list);
+                                }
                             }
                         }
                     }
+
+                if let Some(pixels) = self.pixels.as_mut() {
                     let frame = pixels.frame_mut();
+                    
+                    // Use fill for better performance than chunks_exact_mut if clearing to one color
+                    frame.fill(0); // Clear to black
+                    // Or your specific color:
                     for pixel in frame.chunks_exact_mut(4) { pixel.copy_from_slice(&[20, 20, 20, 255]); }
 
                     let (mx, my) = self.mouse_pos;
@@ -545,6 +605,14 @@ impl ApplicationHandler for MyApp {
                     // Sidebar
                     Self::draw_rect(frame, 10, 70, 150, 460, [40, 40, 40, 255]); 
 
+                    // Sort Options
+                    Self::draw_rect(frame, 170, 45, 55, 20, [150, 0, 255, 255]);
+                    Self::draw_rect(frame, 230, 45, 155, 20, [150, 0, 255, 255]);
+                    Self::draw_rect(frame, 390, 45, 195, 20, [150, 0, 255, 255]);
+                    Self::draw_rect(frame, 590, 45, 95, 20, [150, 0, 255, 255]);
+                    Self::draw_rect(frame, 690, 45, 95, 20, [150, 0, 255, 255]);
+                    Self::draw_rect(frame, 790, 45, 80, 20, [150, 0, 255, 255]);
+
                     // File List
                     for i in 0..VISIBLE_COUNT {
                         let actual_idx = self.scroll_index + i;
@@ -556,15 +624,13 @@ impl ApplicationHandler for MyApp {
                         let col = if is_selected { [180, 0, 0, 255] } else if is_hovered { [60, 60, 60, 255] } else { [35, 35, 35, 255] };
                         Self::draw_rect(frame, LIST_X as u32, y_pos, LIST_W as u32, 22, col);
                         
-                        let parts: Vec<&str> = self.file_list[actual_idx].split(';').collect();
-                        if parts.len() >= 2 {
-                            self.world.draw_text(frame, parts[0], 180, (y_pos + 16) as usize, 12.0, [255, 215, 0]);
-                            self.world.draw_text(frame, parts[1], 240, (y_pos + 16) as usize, 12.0, [255, 255, 255]);
-                            self.world.draw_text(frame, parts[2], 400, (y_pos + 16) as usize, 12.0, [0, 255, 255]);
-                            self.world.draw_text(frame, parts[3], 600, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
-                            self.world.draw_text(frame, parts[4], 700, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
-                            self.world.draw_text(frame, parts[5], 800, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
-                        }
+                        let item = &self.file_list[actual_idx];
+                        self.world.draw_text(frame, &item.prefix, 180, (y_pos + 16) as usize, 12.0, [255, 215, 0]);
+                        self.world.draw_text(frame, &item.name, 240, (y_pos + 16) as usize, 12.0, [255, 255, 255]);
+                        self.world.draw_text(frame, &item.size, 400, (y_pos + 16) as usize, 12.0, [0, 255, 255]);
+                        self.world.draw_text(frame, &item.mtime, 600, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
+                        self.world.draw_text(frame, &item.atime, 700, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
+                        self.world.draw_text(frame, &item.ctime, 800, (y_pos + 16) as usize, 12.0, [200, 200, 200]);
                     }
 
                     // Selection Rectangle (Drawn on top)
@@ -591,7 +657,7 @@ impl ApplicationHandler for MyApp {
                     }
 
                     // Properties Window (Drawn on top)
-                    if let Some((cx, cy)) = self.properties_window {
+                    if let Some((_cx, _cy)) = self.properties_window {
                         let win_w: u32 = 240;
                         let win_h: u32 = 240;
                         Self::draw_rect(frame, 360 as u32, 150 as u32, win_w, win_h, [50, 50, 50, 255]);
@@ -646,6 +712,26 @@ impl ApplicationHandler for MyApp {
                     Self::draw_rect(frame, 780, 470, 50, 50, [0, 0, 0, 255]);
                     self.world.draw_text(frame, "Prp", 790, 500, 20.0, [255, 255, 255]);
 
+                    // Performance Metrics
+                    self.frame_count += 1;
+                    if self.fps_timer.elapsed().as_secs() >= 1 {
+                        self.sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), true);
+
+                        if let Some(process) = self.sys.process(self.pid) {
+                            self.cpu_usage = process.cpu_usage();
+                            self.ram_usage = process.memory() / 1024 / 1024;
+                            self.vram_usage = process.virtual_memory() / 1024 / 1024;
+                        }
+
+                        println!("FPS: {}; CPU: {:.1}%; RAM: {}MB; VRAM: {}MB", 
+                        self.frame_count, 
+                        self.cpu_usage,
+                        self.ram_usage,
+                        self.vram_usage);
+                        self.frame_count = 0;
+                        self.fps_timer = std::time::Instant::now();
+                    }
+
                     pixels.render().unwrap();
                 }
             }
@@ -658,12 +744,31 @@ impl ApplicationHandler for MyApp {
 fn main() {
     let event_loop = EventLoop::new().unwrap();
     let world = World::new(WIDTH as usize, HEIGHT as usize, FONT_DATA);
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let pid = sysinfo::get_current_pid().expect("Failed to get PID");
     let mut app = MyApp { 
-        window: None, pixels: None, world, 
+        window: None, 
+        pixels: None, 
+        world, 
         input_text: std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned(), 
-        file_list: Vec::new(), temp_list: Vec::new(), receiver: None, scroll_index: 0, 
-        mouse_pos: (0.0, 0.0), is_dragging_scrollbar: false, selected_indices: HashSet::new(), 
-        context_menu: None, selection_start: None, selection_rect: None, clipboard: None, properties_window: None,
+        file_list: Vec::new(), 
+        temp_list: Vec::new(), 
+        receiver: None, 
+        scroll_index: 0, 
+        mouse_pos: (0.0, 0.0), 
+        is_dragging_scrollbar: false, 
+        selected_indices: HashSet::new(), 
+        context_menu: None, 
+        selection_start: None, 
+        selection_rect: None, 
+        clipboard: None, 
+        properties_window: None,
+        sort_prop: scan_dir::SortProperty::Name,
+        sort_order: scan_dir::SortOrder::Asc,
+        show_hidden: false, 
+        fps_timer: std::time::Instant::now(), frame_count: 0,
+        sys, cpu_usage: 0.0, ram_usage: 0, vram_usage: 0, pid,
     }; 
     event_loop.run_app(&mut app).unwrap(); 
 }
