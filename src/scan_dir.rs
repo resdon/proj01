@@ -1,19 +1,22 @@
-use std::fs::{self, File};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{SystemTime, Duration};
+use std::os::unix::fs::PermissionsExt;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortProperty {
     Name,
     Size,
-    Modified,
+    MTime,
+    ATime,
+    CTime,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
-    Asc,
-    Desc,
+    Ascending,
+    Descending,
 }
 
 pub enum ScanMsg {
@@ -27,6 +30,8 @@ struct FileEntry {
     name: String,
     size: u64,
     mtime: SystemTime,
+    atime: SystemTime,
+    ctime: SystemTime,
     display_data: FileDisplay,
 }
 
@@ -37,6 +42,7 @@ pub struct FileDisplay {
     pub mtime: String,
     pub atime: String,
     pub ctime: String,
+    pub permissions: String,
 }
 
 pub fn scan_dir(
@@ -81,6 +87,21 @@ pub fn scan_dir(
 
                     let path = entry.path();
                     if let Ok(meta) = fs::symlink_metadata(&path) {
+                        let mode = meta.permissions().mode();
+                        let _perms = format!("{:o}", mode & 0o777); // Returns octal (e.g., "755")
+                        let readable_perms = format!(
+                            "{}{}{}{}{}{}{}{}{}",
+                            if mode & 0o400 != 0 { 'r' } else { '-' },
+                            if mode & 0o200 != 0 { 'w' } else { '-' },
+                            if mode & 0o100 != 0 { 'x' } else { '-' },
+                            if mode & 0o040 != 0 { 'r' } else { '-' },
+                            if mode & 0o020 != 0 { 'w' } else { '-' },
+                            if mode & 0o010 != 0 { 'x' } else { '-' },
+                            if mode & 0o004 != 0 { 'r' } else { '-' },
+                            if mode & 0o002 != 0 { 'w' } else { '-' },
+                            if mode & 0o001 != 0 { 'x' } else { '-' },
+                        );
+                        
                         let file_type = meta.file_type();
                         let is_dir = file_type.is_dir();
                         let prefix = if file_type.is_symlink() { "[LINK]" } 
@@ -93,7 +114,10 @@ pub fn scan_dir(
                                     else if s >= 1_024 { format!("{:.2} KB", s as f64 / 1_024.0) }
                                     else { format!("{} B", s) };
 
+                        // Capture metadata as SystemTime
                         let mtime_raw = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                        let atime_raw = meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
+                        let ctime_raw = meta.created().unwrap_or(SystemTime::UNIX_EPOCH);
                         
                         // 3. Create the struct here instead of formatting a string
                         let display = FileDisplay {
@@ -101,8 +125,9 @@ pub fn scan_dir(
                             name: raw_name.clone(),
                             size: s_str,
                             mtime: format_ago(mtime_raw),
-                            atime: meta.accessed().map(format_ago).unwrap_or_else(|_| "N/A".into()),
-                            ctime: meta.created().map(format_ago).unwrap_or_else(|_| "N/A".into()),
+                            atime: format_ago(atime_raw),
+                            ctime: format_ago(ctime_raw),
+                            permissions: readable_perms,
                         };
                         
                         file_entries.push(FileEntry {
@@ -110,6 +135,8 @@ pub fn scan_dir(
                             name: raw_name.to_lowercase(),
                             size: s,
                             mtime: mtime_raw,
+                            atime: atime_raw,
+                            ctime: ctime_raw,
                             display_data: display,
                         });
                     }
@@ -126,11 +153,13 @@ pub fn scan_dir(
                     let mut cmp = match prop {
                         SortProperty::Name => a.name.cmp(&b.name),
                         SortProperty::Size => a.size.cmp(&b.size),
-                        SortProperty::Modified => a.mtime.cmp(&b.mtime),
+                        SortProperty::MTime => a.mtime.cmp(&b.mtime),
+                        SortProperty::ATime => a.atime.cmp(&b.atime), // Implement logic if needed
+                        SortProperty::CTime => a.ctime.cmp(&b.ctime),
                     };
 
                     // Apply Order (Asc/Desc) to the property comparison
-                    if order == SortOrder::Desc {
+                    if order == SortOrder::Descending {
                         cmp = cmp.reverse();
                     }
 
